@@ -6,11 +6,10 @@ import os
 import pickle
 import random
 import time
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import torch
-from petlib.pack import decode, encode
 from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -23,15 +22,22 @@ from reduce import (
 )
 
 MAX_TIME_BEFORE_PLANT_ERROR = 300  # seconds
+MAX_TIME_BEFORE_GIVE_UP_SAMPLE_VALID_TOKEN = 300  # seconds
+
 STOP_TOKEN = "</s>"
 
 logging.basicConfig(filename="logging.log", encoding="utf-8", level=logging.INFO)
+
 
 def main(args: argparse.Namespace) -> None:
     generated_text = generate_text(args)
     print(generated_text, file=open("wat.txt", "w"))
 
+
 def generate_text(args: argparse.Namespace) -> str:
+    """Generate text using the specified algorithm and return the generated text."""
+
+    # Manually set pseudorandom seeds for reproducibility.
     if args.seed:
         torch.manual_seed(args.seed)
         np.random.seed(args.seed)
@@ -51,11 +57,37 @@ def generate_text(args: argparse.Namespace) -> str:
     )
 
     if args.gen_type == "plain":
-        generated_text, _ = generate_text_plain(args.prompt, args.num_tokens, model, tokenizer, args.sample_type)
+        (
+            generated_text,
+            generated_tokens,
+        ) = generate_text_plain(
+            args.prompt,
+            args.num_tokens,
+            model,
+            tokenizer,
+            args.sample_type,
+        )
     elif args.gen_type == "plain_with_bits":
-        generated_text, _, _ = generate_text_plain_with_bits(args.prompt, args.num_tokens, model, tokenizer, args.sample_type)
+        (
+            generated_text,
+            generated_tokens,
+            bitstring,
+        ) = generate_text_plain_with_bits(
+            args.prompt,
+            args.num_tokens,
+            model,
+            tokenizer,
+            args.sample_type,
+        )
     elif args.gen_type == "asymmetric":
-        generated_text, _, pk, params, _, _ = generate_text_asymmetric(
+        (
+            generated_text,
+            generated_tokens,
+            pk,
+            params,
+            num_tokens,
+            num_planted_errors,
+        ) = generate_text_asymmetric(
             args.prompt,
             model,
             tokenizer,
@@ -70,7 +102,11 @@ def generate_text(args: argparse.Namespace) -> str:
             args.continue_until_stop_token,
         )
     elif args.gen_type == "symmetric":
-        generated_text, _, _ = generate_text_symmetric(
+        (
+            generated_text,
+            generated_tokens,
+            bitstring,
+        ) = generate_text_symmetric(
             args.prompt,
             args.num_tokens,
             model,
@@ -79,192 +115,796 @@ def generate_text(args: argparse.Namespace) -> str:
             args.security_parameter,
         )
     else:
-        raise ValueError(f"Unsupported gen_type: {args.gen_type}")
+        raise ValueError(f"gen_type {args.gen_type} not supported", args.gen_type)
 
     return generated_text
 
-def generate_text_plain(prompt, num_tokens, model, tokenizer, sample_type):
-    inputs = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
-    initial_len = inputs.shape[1]
+
+def generate_text_plain(
+    prompt: str,
+    num_tokens: int,
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    sample_type: str,
+) -> tuple[str, torch.Tensor]:
+    """Generate text using the plain algorithm and return the generated text and tokens."""
+
+    vocab_size = len(tokenizer)
+    inputs = tokenizer.encode(
+        prompt,
+        return_tensors="pt",
+        add_special_tokens=False,
+        padding=False,
+        truncation=False,
+    ).to(model.device)
+    initial_inputs_len = inputs.size(1)
     attn = torch.ones_like(inputs)
     past = None
+
+    for i in tqdm(range(num_tokens)):
+        token, inputs, past, attn = sample_token(
+            model, tokenizer, inputs, past, attn, vocab_size, sample_type
+        )
+
+    generated_tokens = inputs[:, initial_inputs_len:].squeeze().detach().cpu()
+    generated_text = tokenizer.decode(
+        generated_tokens,
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=True,
+    )
+    return generated_text, generated_tokens
+
+
+def generate_text_plain_with_bits(
+    prompt: str,
+    num_tokens: int,
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    sample_type: str,
+) -> tuple[str, torch.Tensor, str]:
+    """Generate text using the plain_with_bits algorithm and return the generated text, tokens, and bitstring."""
+
+    encode, decode, padded_encoding, max_bit_length = simple_encoder(
+        tokenizer.get_vocab().values()
+    )
+
     vocab_size = len(tokenizer)
-
-    for _ in tqdm(range(num_tokens)):
-        token, inputs, past, attn = sample_token(model, tokenizer, inputs, past, attn, vocab_size, sample_type)
-
-    output_tokens = inputs[:, initial_len:]
-    output_text = tokenizer.decode(output_tokens.squeeze(), skip_special_tokens=True)
-    return output_text, output_tokens
-
-def generate_text_plain_with_bits(prompt, num_tokens, model, tokenizer, sample_type):
-    encode, decode_fn, padded_encoding, max_bit_length = simple_encoder(tokenizer.get_vocab().values())
-    inputs = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
-    initial_len = inputs.shape[1]
+    prompt_tensor: torch.Tensor = tokenizer.encode(
+        prompt, return_tensors="pt", truncation=True, max_length=2048
+    )
+    inputs = prompt_tensor.to(model.device)
+    # Save initial_inputs_len to truncate at the end to exclude the prompt from the generated_text output.
+    initial_inputs_len = inputs.size(1)
     attn = torch.ones_like(inputs)
     past = None
-    vocab_size = len(tokenizer)
+
     bitstring = ""
-
-    for _ in tqdm(range(num_tokens)):
-        with torch.no_grad():
-            if past:
-                output = model(inputs[:, -1:], past_key_values=past, attention_mask=attn)
-            else:
-                output = model(inputs)
-        probs = torch.softmax(output.logits[:, -1, :vocab_size], dim=-1).cpu().numpy().squeeze()
-        bits = ""
-        for j in range(max_bit_length):
-            bit = sample_bit(probs, padded_encoding, j, max_bit_length, bits, sample_type)
-            bits += str(bit)
-        token = decode_fn(bits)
-        inputs = torch.cat([inputs, torch.tensor([[token]]).to(model.device)], dim=-1)
-        past = output.past_key_values
-        attn = torch.cat([attn, attn.new_ones((attn.shape[0], 1))], dim=-1)
-        bitstring += bits
-
-    output_tokens = inputs[:, initial_len:]
-    output_text = tokenizer.decode(output_tokens.squeeze(), skip_special_tokens=True)
-    return output_text, output_tokens, bitstring
-
-def generate_text_symmetric(prompt, num_tokens, model, tokenizer, sample_type, security_parameter):
-    encode, decode_fn, padded_encoding, max_bit_length = simple_encoder(tokenizer.get_vocab().values())
-    inputs = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
-    initial_len = inputs.shape[1]
-    attn = torch.ones_like(inputs)
-    past = None
-    vocab_size = len(tokenizer)
-    entropy = 0.0
-    bitstring = ""
-    r = ""
-
+    counter = 0
     for i in tqdm(range(num_tokens)):
         with torch.no_grad():
             if past:
-                output = model(inputs[:, -1:], past_key_values=past, attention_mask=attn)
+                output = model(
+                    inputs[:, -1:], past_key_values=past, attention_mask=attn
+                )
             else:
                 output = model(inputs)
-        probs = torch.softmax(output.logits[:, -1, :vocab_size], dim=-1).cpu().numpy().squeeze()
+
+        probs_tensor = torch.nn.functional.softmax(
+            output.logits[:, -1, :vocab_size], dim=-1
+        ).cpu()
+
+        probs = list(probs_tensor.squeeze().numpy())
         bits = ""
-        prev_bits = ""
         for j in range(max_bit_length):
-            pr = get_probability_distribution_for_bit(probs, padded_encoding, j, max_bit_length, prev_bits)
+            bit = sample_bit(
+                probs,
+                padded_encoding,
+                j,
+                max_bit_length,
+                bits,
+                sample_type,
+            )
+            bits += str(bit)
+            counter += 1
+        token = decode(bits)
+        token_tensor = torch.tensor([[token]]).to(model.device)
+
+        inputs = torch.cat([inputs, token_tensor], dim=-1)
+        past = output.past_key_values
+        attn = torch.cat([attn, attn.new_ones((attn.shape[0], 1))], dim=-1)
+
+    generated_tokens = inputs[:, initial_inputs_len:]
+    generated_text = tokenizer.decode(
+        generated_tokens.squeeze().detach().cpu(),
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=True,
+    )
+    return generated_text, generated_tokens, bitstring
+
+
+def generate_text_symmetric(
+    prompt: str,
+    num_tokens: int,
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    sample_type: str,
+    security_parameter: float,
+) -> tuple[str, torch.Tensor, str]:
+    """Generate text using the symmetric algorithm and return the generated text, tokens, and bitstring."""
+
+    encode, decode, padded_encoding, max_bit_length = simple_encoder(
+        tokenizer.get_vocab().values()
+    )
+
+    vocab_size = len(tokenizer)
+    inputs = tokenizer.encode(
+        prompt,
+        return_tensors="pt",
+        add_special_tokens=False,
+        padding=False,
+        truncation=False,
+    ).to(model.device)
+    initial_inputs_len = inputs.size(1)
+    attn = torch.ones_like(inputs)
+    past = None
+
+    entropy: float = 0
+    bitstring = ""
+    r = ""
+    counter = 0
+    for i in tqdm(range(num_tokens)):
+        with torch.no_grad():
+            if past:
+                output = model(
+                    inputs[:, -1:], past_key_values=past, attention_mask=attn
+                )
+            else:
+                output = model(inputs)
+
+        probs_tensor = torch.nn.functional.softmax(
+            output.logits[:, -1, :vocab_size], dim=-1
+        ).cpu()
+
+        probs = list(probs_tensor.squeeze().numpy())
+        bits = ""
+        previous_bits = ""
+        for j in range(max_bit_length):
+            pr = get_probability_distribution_for_bit(
+                probs,
+                padded_encoding,
+                j,
+                max_bit_length,
+                previous_bits,
+            )
+
             if entropy < security_parameter:
                 bit = sample_bit_by_sample_type(sample_type, pr)
                 entropy -= math.log2(pr[bit])
                 if entropy >= security_parameter:
                     r = bitstring + str(bit)
             else:
-                hash_index = i * max_bit_length + j
-                unkeyed_hash = crypto.unkeyed_hash_to_float(bytes(r, "utf-8") + bytes(bin(hash_index), "utf-8"))
+                # Embed the watermark
+                hash_index = (i * max_bit_length) + j
+                unkeyed_hash = crypto.unkeyed_hash_to_float(
+                    bytes(r, "utf-8") + bytes(bin(hash_index), "utf-8")
+                )
                 bit = 1 if unkeyed_hash <= pr[1] else 0
-            bits += str(bit)
-            prev_bits = bits
-        token = decode_fn(bits)
-        inputs = torch.cat([inputs, torch.tensor([[token]]).to(model.device)], dim=-1)
+
+            counter += 1
+            bitstring += str(bit)
+            bits = previous_bits + str(bit)
+            previous_bits = bits
+
+        token = decode(bits)
+        token_tensor = torch.tensor([[token]]).to(model.device)
+
+        inputs = torch.cat([inputs, token_tensor], dim=-1)
         past = output.past_key_values
         attn = torch.cat([attn, attn.new_ones((attn.shape[0], 1))], dim=-1)
-        bitstring += bits
 
-    output_tokens = inputs[:, initial_len:]
-    output_text = tokenizer.decode(output_tokens.squeeze(), skip_special_tokens=True)
-    return output_text, output_tokens, bitstring
+    generated_tokens = inputs[:, initial_inputs_len:]
+    generated_text = tokenizer.decode(
+        generated_tokens.squeeze().detach().cpu(),
+        skip_special_tokens=True,
+        clean_up_tokenization_spaces=True,
+    )
+    return generated_text, generated_tokens, bitstring
 
-def generate_text_asymmetric(prompt, model, tokenizer, sample_type, message_length, signature_segment_length, bit_size, max_planted_errors, sk_path, pk_path, params_path, continue_until_stop_token):
-    inputs = tokenizer.encode(prompt, return_tensors="pt").to(model.device)
-    initial_len = inputs.shape[1]
+
+def generate_text_asymmetric(
+    prompt: str,
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    sample_type: str,
+    message_length: int,
+    signature_segment_length: int,
+    bit_size: int,
+    max_planted_errors: int,
+    sk_path: str | None,
+    pk_path: str | None,
+    params_path: str | None,
+    continue_until_stop_token: bool = False,
+) -> tuple[
+    str,
+    torch.Tensor,
+    bytes,
+    tuple,
+    int,
+    int,
+]:
+    """
+    Generate text using the asymmetric algorithm and return:
+      - generated_text
+      - generated_tokens
+      - pk
+      - params (generic tuple for Falcon)
+      - num_tokens
+      - num_planted_errors
+    """
+
+    vocab_size = len(tokenizer)
+    inputs = tokenizer.encode(
+        prompt,
+        return_tensors="pt",
+        add_special_tokens=False,
+        padding=False,
+        truncation=False,
+    ).to(model.device)
+
+    # Save initial_inputs_len to exclude the prompt from the final output.
+    initial_inputs_len = inputs.size(1)
+
     attn = torch.ones_like(inputs)
-    past = None
+    past: torch.Tensor | None = None
 
-    if sk_path and os.path.exists(sk_path) and pk_path and os.path.exists(pk_path) and params_path and os.path.exists(params_path):
-        logging.info("loading Falcon keys from disk")
+    sk: list = []
+    pk: bytes = b""
+    params: tuple = ()
+
+    # Load or generate the Falcon secret key, public key, and parameters
+    if (sk_path and pk_path and params_path) and (
+        os.path.exists(sk_path)
+        and os.path.exists(pk_path)
+        and os.path.exists(params_path)
+    ):
+        logging.info(f"loading existing Falcon keys: {sk_path}, {pk_path}, {params_path}")
         with open(sk_path, "rb") as f:
-            sk = decode(pickle.load(f))
-        with open(pk_path, "rb") as f:
-            pk = decode(pickle.load(f))
-        with open(params_path, "rb") as f:
-            params = decode(pickle.load(f))
+            sk = pickle.load(f)
+        with open(pk_path, "rb") as g:
+            pk = pickle.load(g)
+        with open(params_path, "rb") as h:
+            params = pickle.load(h)
     else:
-        logging.info("generating new Falcon keys")
+        logging.info("generating new Falcon keys and params")
         sk, pk, params = crypto.falcon_generate()
         if sk_path:
+            logging.info(f"saving sk to {sk_path}")
             with open(sk_path, "wb") as f:
-                pickle.dump(encode(sk), f)
+                pickle.dump(sk, f)
         if pk_path:
-            with open(pk_path, "wb") as f:
-                pickle.dump(encode(pk), f)
+            logging.info(f"saving pk to {pk_path}")
+            with open(pk_path, "wb") as g:
+                pickle.dump(pk, g)
         if params_path:
-            with open(params_path, "wb") as f:
-                pickle.dump(encode(params), f)
+            logging.info(f"saving params to {params_path}")
+            with open(params_path, "wb") as h:
+                pickle.dump(params, h)
 
-    message = prompt.encode("utf-8")
-    message_hash = hashlib.sha256(message).digest()
+    counter = 0
+    generated_text = ""
+
+    if continue_until_stop_token:
+        # Embed first message-signature pair, then keep going until STOP_TOKEN
+        embedded_first_message_signature_pair = False
+        while True:
+            (
+                message_signature_pair,
+                inputs,
+                past,
+                attn,
+                counter,
+                planted_errors,
+            ) = generate_message_signature_pair(
+                message_length,
+                signature_segment_length,
+                bit_size,
+                max_planted_errors,
+                sk,
+                params,
+                model,
+                tokenizer,
+                vocab_size,
+                sample_type,
+                inputs,
+                past,
+                attn,
+                counter,
+                embedded_first_message_signature_pair,
+            )
+            generated_text += message_signature_pair
+            embedded_first_message_signature_pair = True
+            if STOP_TOKEN in generated_text:
+                generated_text = generated_text[: generated_text.index(STOP_TOKEN)]
+                break
+    else:
+        # Just embed one message-signature pair
+        (
+            message_signature_pair,
+            inputs,
+            past,
+            attn,
+            counter,
+            planted_errors,
+        ) = generate_message_signature_pair(
+            message_length,
+            signature_segment_length,
+            bit_size,
+            max_planted_errors,
+            sk,
+            params,
+            model,
+            tokenizer,
+            vocab_size,
+            sample_type,
+            inputs,
+            past,
+            attn,
+            counter,
+            False,
+        )
+        generated_text += message_signature_pair
+
+    generated_tokens = inputs[:, initial_inputs_len:]
+    return (
+        generated_text,
+        generated_tokens,
+        pk,
+        params,
+        counter,
+        planted_errors,
+    )
+
+
+def generate_message_signature_pair(
+    message_length: int,
+    signature_segment_length: int,
+    bit_size: int,
+    max_planted_errors: int,
+    sk: list,
+    params: tuple,
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    vocab_size: int,
+    sample_type: str,
+    inputs: torch.Tensor,
+    past: torch.Tensor | None,
+    attn: torch.Tensor,
+    counter: int,
+    embedded_first_message_signature_pair: bool,
+) -> tuple[
+    str,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor,
+    int,
+    int,
+]:
+    """
+    Generate one message-signature pair, using the existing logic.
+    """
+
+    message_signature_pair = ""
+
+    (
+        message,
+        start_of_signature_segment,
+        inputs,
+        past,
+        attn,
+        counter,
+    ) = sample_n_characters(
+        message_length,
+        "",  # Start with an empty message
+        model,
+        tokenizer,
+        vocab_size,
+        sample_type,
+        inputs,
+        past,
+        attn,
+        counter,
+        embedded_first_message_signature_pair,
+    )
+    message_signature_pair += message
+
+    if STOP_TOKEN in message_signature_pair:
+        return message_signature_pair, inputs, past, attn, counter, 0
+
+    # Sign the message using Falcon
+    message_hash = hashlib.sha256(bytes(message, "utf-8")).digest()
     signature = crypto.sign_and_encode_openssl(sk, message_hash, params, max_planted_errors)
-    logging.info(f"signature: {signature}")
 
-    # Placeholder: actual asymmetric embedding logic goes here
-    # For now we just return the prompt + fake signature string
-    generated_text = prompt + "\n[FALCON_SIG] " + signature[:64] + "..."
-    generated_tokens = tokenizer.encode(generated_text, return_tensors="pt")
-    return generated_text, generated_tokens, pk, params, 0, 0
+    logging.info(f"signature\n{signature}")
+
+    prev_sig_bits = ""
+    planted_errors = 0
+    signature_codeword_length = crypto.get_signature_codeword_length(
+        max_planted_errors, bit_size
+    )
+
+    # Embed the signature
+    for i in tqdm(range(signature_codeword_length // bit_size)):
+        if STOP_TOKEN in message_signature_pair:
+            return message_signature_pair, inputs, past, attn, counter, planted_errors
+
+        # Save copies of inputs, past, attn in case we need to retry
+        inputs_before_signature_sampling = inputs
+        past_before_signature_sampling = past
+        attn_before_signature_sampling = attn
+
+        start_of_signature_segment_before_signature_sampling = start_of_signature_segment
+        is_signature_segment_valid = False
+
+        # Extract next signature bits
+        signature_bit, signature = signature[:bit_size], signature[bit_size:]
+        counter_before_signature_segment_sampling = counter
+
+        initial_time = time.time()
+        best_match_value = -1
+        best_match = ""
+        best_inputs = torch.Tensor()
+        best_past = None
+        best_attn = torch.Tensor()
+        best_unkeyed_hash = None
+        best_next_signature_segment = ""
+
+        while not is_signature_segment_valid:
+            # Reset to stored checkpoint
+            inputs = inputs_before_signature_sampling
+            past = past_before_signature_sampling
+            attn = attn_before_signature_sampling
+            counter = counter_before_signature_segment_sampling
+
+            (
+                signature_segment,
+                next_signature_segment,
+                inputs,
+                past,
+                attn,
+                counter,
+            ) = sample_n_characters(
+                signature_segment_length,
+                start_of_signature_segment_before_signature_sampling,
+                model,
+                tokenizer,
+                vocab_size,
+                sample_type,
+                inputs,
+                past,
+                attn,
+                counter,
+                embedded_first_message_signature_pair,
+            )
+
+            unkeyed_hash = crypto.unkeyed_hash_to_bits(
+                bytes(message, "utf-8")
+                + bytes(prev_sig_bits, "utf-8")
+                + bytes(signature_segment, "utf-8"),
+                bit_size,
+            )
+
+            is_signature_segment_valid = (int(unkeyed_hash) == int(signature_bit))
+
+            use_planted_errors = max_planted_errors > 0
+            if use_planted_errors and not is_signature_segment_valid:
+                curr_match_value = sum(
+                    1 if unkeyed_hash[i] == signature_bit[i] else 0
+                    for i in range(len(unkeyed_hash))
+                )
+                if curr_match_value > best_match_value:
+                    best_match_value = curr_match_value
+                    best_match = signature_segment
+                    best_inputs = inputs
+                    best_past = past
+                    best_attn = attn
+                    best_unkeyed_hash = unkeyed_hash
+                    best_next_signature_segment = next_signature_segment
+
+                if (
+                    (time.time() - initial_time) >= MAX_TIME_BEFORE_PLANT_ERROR
+                    and planted_errors < max_planted_errors
+                ):
+                    signature_segment = best_match
+                    inputs = best_inputs
+                    past = best_past
+                    attn = best_attn
+                    unkeyed_hash = best_unkeyed_hash
+                    next_signature_segment = best_next_signature_segment
+
+                    planted_errors += (bit_size - best_match_value)
+                    logging.info(
+                        f"planting {bit_size-best_match_value} errors, best_match: {best_match}, total errors: {planted_errors}"
+                    )
+                    break
+                elif (
+                    (time.time() - initial_time) >= MAX_TIME_BEFORE_PLANT_ERROR
+                    and planted_errors >= max_planted_errors
+                ):
+                    logging.info(
+                        f"tried to plant another error but already at max_planted_errors: {max_planted_errors}"
+                    )
+                    raise ValueError(
+                        f"tried to plant another error but already at max_planted_errors: {max_planted_errors}"
+                    )
+            elif (time.time() - initial_time) >= MAX_TIME_BEFORE_PLANT_ERROR:
+                logging.info(
+                    f"signature segment {signature_segment} took too long to hash to {signature_bit}, raising exception"
+                )
+                raise ValueError(
+                    f"signature segment {signature_segment} took too long to hash to {signature_bit}"
+                )
+
+        prev_sig_bits += unkeyed_hash
+        message_signature_pair += signature_segment
+        start_of_signature_segment = next_signature_segment
+
+    logging.info(f"error signature\n{prev_sig_bits}")
+
+    return message_signature_pair, inputs, past, attn, counter, planted_errors
 
 
-def sample_token(model, tokenizer, inputs, past, attn, vocab_size, sample_type, embedded_first=False, top_p=0.9, temperature=0.9):
-    sampled = False
-    while not sampled:
+def sample_n_characters(
+    n: int,
+    start_of_n_characters: str,
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    vocab_size: int,
+    sample_type: str,
+    inputs: torch.Tensor,
+    past: torch.Tensor | None,
+    attn: torch.Tensor,
+    counter: int,
+    embedded_first_message_signature_pair: bool,
+) -> tuple[
+    str,
+    str,
+    torch.Tensor,
+    torch.Tensor | None,
+    torch.Tensor,
+    int,
+]:
+    """
+    Sample n characters using the provided inputs.
+    """
+
+    n_character_str = start_of_n_characters
+    overflow_str = ""
+
+    while len(n_character_str) < n:
+        prev_inputs = inputs
+
+        token, inputs, past, attn = sample_token(
+            model,
+            tokenizer,
+            inputs,
+            past,
+            attn,
+            vocab_size,
+            sample_type,
+            embedded_first_message_signature_pair,
+        )
+        counter += 1
+        token_str = decode_token(token, prev_inputs, inputs, tokenizer)
+
+        n_character_str += token_str
+
+        if len(n_character_str) > n:
+            overflow_str = n_character_str[n:]
+            n_character_str = n_character_str[:n]
+
+        if token_str == STOP_TOKEN:
+            break
+
+    return (
+        n_character_str,
+        overflow_str,
+        inputs,
+        past,
+        attn,
+        counter,
+    )
+
+
+def decode_token(
+    token: torch.Tensor,
+    prev_inputs: torch.Tensor,
+    inputs: torch.Tensor,
+    tokenizer: AutoTokenizer,
+) -> str | Any:
+    """Decode a single token and return the decoded token string."""
+
+    token_str = tokenizer.decode(token.squeeze().detach().cpu())
+    prev_inputs_str = tokenizer.decode(prev_inputs.squeeze().detach().cpu())
+    new_inputs_str = tokenizer.decode(inputs.squeeze().detach().cpu())
+    token_str = new_inputs_str[len(prev_inputs_str) :]
+    return token_str
+
+
+def sample_token(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    inputs: torch.Tensor,
+    past: torch.Tensor | None,
+    attn: torch.Tensor,
+    vocab_size: int,
+    sample_type: str,
+    embedded_first_message_signature_pair: bool = False,
+    top_p: float = 0.9,
+    temperature: float = 0.9,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor]:
+    """
+    Sample a token along with updated inputs, past, and attn.
+    """
+
+    sampled_valid_token = False
+    num_sample_attempts = 0
+    initial_time = time.time()
+
+    while not sampled_valid_token:
+        if (time.time() - initial_time) >= MAX_TIME_BEFORE_PLANT_ERROR:
+            logging.info(
+                "sample_token took too long to sample a valid token, raising exception"
+            )
+            raise ValueError("sample_token took too long to sample a valid token")
+
         with torch.no_grad():
             if past:
-                output = model(inputs[:, -1:], past_key_values=past, attention_mask=attn)
+                output = model(
+                    inputs[:, -1:], past_key_values=past, attention_mask=attn
+                )
             else:
                 output = model(inputs)
+
             logits = output.logits[:, -1, :vocab_size]
 
             if sample_type == "argmax":
-                token = torch.argmax(logits, dim=-1, keepdim=True)
+                probs = torch.nn.functional.softmax(logits, dim=-1)
+                token = torch.argmax(probs, dim=-1)
             elif sample_type == "multinomial":
-                probs = torch.softmax(logits, dim=-1)
+                probs = torch.nn.functional.softmax(logits, dim=-1)
                 token = torch.multinomial(probs, num_samples=1)
             elif sample_type == "nucleus":
-                sorted_logits, sorted_indices = torch.sort(logits / temperature, descending=True)
-                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_logits, sorted_indices = torch.sort(
+                    logits / temperature, descending=True
+                )
+                cumulative_probs = torch.cumsum(
+                    torch.softmax(sorted_logits, dim=-1), dim=-1
+                )
                 sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[
+                    ..., :-1
+                ].clone()
                 sorted_indices_to_remove[..., 0] = 0
                 indices_to_remove = sorted_indices[sorted_indices_to_remove]
                 logits[..., indices_to_remove] = float("-inf")
-                probs = torch.softmax(logits, dim=-1)
+                probs = torch.nn.functional.softmax(logits, dim=-1)
                 token = torch.multinomial(probs, num_samples=1)
             else:
-                raise ValueError(f"Unsupported sample_type: {sample_type}")
+                raise ValueError(f"sample_type {sample_type} not supported")
 
-            token_str = tokenizer.decode(token.squeeze().cpu())
-            if not embedded_first and STOP_TOKEN in token_str:
-                continue  # try again
-            sampled = True
+            num_sample_attempts += 1
+            token_str = tokenizer.decode(token.squeeze().detach().cpu())
+            if not embedded_first_message_signature_pair and STOP_TOKEN in token_str:
+                logging.info(f"sampled stop token: {token_str}, retrying")
+                sampled_valid_token = False
+                continue
+            else:
+                sampled_valid_token = True
 
             token = token.to(inputs.device)
-            inputs = torch.cat([inputs, token.unsqueeze(0)], dim=-1)
+            token = token.unsqueeze(0) if token.dim() == 1 else token  # just in case
+            inputs = torch.cat([inputs, token], dim=-1)
             past = output.past_key_values
             attn = torch.cat([attn, attn.new_ones((attn.shape[0], 1))], dim=-1)
 
     return token, inputs, past, attn
 
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--prompt", default="There once was a", type=str)
-    parser.add_argument("--model", default="mistralai/Mistral-7B-v0.1", type=str)
-    parser.add_argument("--load-in-4bit", action=argparse.BooleanOptionalAction)
-    parser.add_argument("--num-tokens", default=80, type=int)
-    parser.add_argument("--seed", default=0, type=int)
-    parser.add_argument("--gen-type", default="asymmetric", choices=["plain", "plain_with_bits", "symmetric", "asymmetric"])
-    parser.add_argument("--sample-type", default="multinomial", choices=["argmax", "multinomial", "nucleus"])
-    parser.add_argument("--sk", default="sk.pickle", type=str)
-    parser.add_argument("--pk", default="pk.pickle", type=str)
-    parser.add_argument("--params", default="params.pickle", type=str)
-    parser.add_argument("--message-length", default=crypto.DEFAULT_MESSAGE_LENGTH, type=int)
-    parser.add_argument("--signature-segment-length", default=crypto.DEFAULT_SIGNATURE_SEGMENT_LENGTH, type=int)
-    parser.add_argument("--bit-size", default=crypto.DEFAULT_BIT_SIZE, type=int)
-    parser.add_argument("--max-planted-errors", default=crypto.DEFAULT_MAX_PLANTED_ERRORS, type=int)
-    parser.add_argument("--continue-until-stop-token", action=argparse.BooleanOptionalAction)
-    parser.add_argument("--security-parameter", default=crypto.DEFAULT_SECURITY_PARAMETER, type=int)
+    parser = argparse.ArgumentParser(description="generate text")
+    parser.add_argument(
+        "--prompt", default="There once was a", type=str, help="the generation prompt"
+    )
+    parser.add_argument(
+        "--model",
+        default="mistralai/Mistral-7B-v0.1",
+        type=str,
+        help="the id of the Hugging Face model to use",
+    )
+    parser.add_argument(
+        "--load-in-4bit",
+        action=argparse.BooleanOptionalAction,
+        help="whether to load the model with 4-bit quantization",
+    )
+    parser.add_argument(
+        "--num-tokens", default=80, type=int, help="the number of generated tokens"
+    )
+    parser.add_argument(
+        "--seed",
+        default=0,
+        type=int,
+        help="a seed for the PyTorch random number generator",
+    )
+    parser.add_argument(
+        "--gen-type",
+        default="asymmetric",
+        type=str,
+        help="the algorithm to use for generation, one of: 'plain', 'plain_with_bits', 'symmetric', 'asymmetric'",
+        choices=("plain", "plain_with_bits", "symmetric", "asymmetric"),
+    )
+    parser.add_argument(
+        "--sample-type",
+        default="multinomial",
+        type=str,
+        help="the type of sampling to use at generation time, one of: 'argmax', 'multinomial', 'nucleus'",
+        choices=("argmax", "multinomial", "nucleus"),
+    )
+
+    # The following arguments are used in asymmetric watermarking only: sk, pk, params, signature_segment_length, bit_size, max_planted_errors, continue_until_stop_token
+    parser.add_argument(
+        "--sk",
+        default="sk.pickle",
+        type=str,
+        help="the path for the secret generation key pickle file; if a file already exists at this path, it will be loaded and reused",
+    )
+    parser.add_argument(
+        "--pk",
+        default="pk.pickle",
+        type=str,
+        help="the output path for the public detection key pickle file",
+    )
+    parser.add_argument(
+        "--params",
+        default="params.pickle",
+        type=str,
+        help="the path for the params pickle file; if a file already exists at this path, it will be loaded and reused",
+    )
+    parser.add_argument(
+        "--message-length",
+        default=crypto.DEFAULT_MESSAGE_LENGTH,
+        type=int,
+        help="the length of the message in characters. The default value is signature-segment-length // bit-size",
+    )
+    parser.add_argument(
+        "--signature-segment-length",
+        default=crypto.DEFAULT_SIGNATURE_SEGMENT_LENGTH,
+        type=int,
+        help="the length of each signature segment in characters",
+    )
+    parser.add_argument(
+        "--bit-size",
+        default=crypto.DEFAULT_BIT_SIZE,
+        type=int,
+        help="the number of signature bits in each segment",
+    )
+    parser.add_argument(
+        "--max-planted-errors",
+        default=crypto.DEFAULT_MAX_PLANTED_ERRORS,
+        type=int,
+        help="the number of error correcting symbols to use",
+    )
+    parser.add_argument(
+        "--continue-until-stop-token",
+        action=argparse.BooleanOptionalAction,
+        help="flag to keep sampling until a stop token after the first message-signature pair is embedded",
+    )
+
+    # The following argument is used in symmetric watermarking only: security_parameter
+    parser.add_argument(
+        "--security-parameter",
+        default=crypto.DEFAULT_SECURITY_PARAMETER,
+        type=int,
+        help="the security parameter for the symmetric watermarking algorithm",
+    )
+
     main(parser.parse_args())
