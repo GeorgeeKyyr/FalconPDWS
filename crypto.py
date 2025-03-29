@@ -4,8 +4,8 @@ from typing import Any
 from bitstring import BitArray
 from reedsolo import RSCodec
 
-# Falcon implementation from pqcrypto
-from falcon import generate_keypair, sign, verify
+# Falcon implementation (your local falcon.py)
+from falcon import SecretKey, PublicKey
 
 # Constants
 SIGNATURE_LENGTH: int = 666  # Falcon-512 signatures are ~666 bytes
@@ -17,17 +17,21 @@ DEFAULT_MESSAGE_LENGTH = DEFAULT_SIGNATURE_SEGMENT_LENGTH // DEFAULT_BIT_SIZE
 DEFAULT_MAX_PLANTED_ERRORS = 2
 DEFAULT_SECURITY_PARAMETER = 16
 
+
 def get_signature_codeword_length(max_planted_errors: int, bit_size: int) -> int:
     codeword_length = SIGNATURE_LENGTH + (REED_SOLO_CONSTANT * max_planted_errors * 2)
     assert codeword_length % bit_size == 0
     return codeword_length
 
+
 def unkeyed_hash_to_float(input_bytes: bytes) -> float:
     return float(unpack("L", hashlib.sha256(input_bytes).digest()[:8])[0]) / 2**64
+
 
 def unkeyed_hash_to_bits(input_bytes: bytes, bit_size: int) -> str:
     assert bit_size <= 256
     return BitArray(bytes=hashlib.sha256(input_bytes).digest()).bin[:bit_size]
+
 
 def bytes_to_binary_codeword(input_bytes: bytes, max_planted_errors: int) -> str:
     if max_planted_errors == 0:
@@ -35,26 +39,31 @@ def bytes_to_binary_codeword(input_bytes: bytes, max_planted_errors: int) -> str
     rsc = RSCodec(max_planted_errors * 2)
     return BitArray(bytes=rsc.encode(input_bytes)).bin
 
+
 def binary_codeword_to_bytes(binary_codeword: str, max_planted_errors: int) -> bytes:
     if max_planted_errors == 0:
         return BitArray(bin=binary_codeword).bytes
     rsc = RSCodec(max_planted_errors * 2)
     return rsc.decode(BitArray(bin=binary_codeword).bytes)[0]
 
+
 # FALCON FUNCTIONS
-def falcon_generate() -> tuple[list, bytes, tuple]:
-    pk, sk = generate_keypair()
+def falcon_generate() -> tuple[list, PublicKey, tuple]:
+    sk = SecretKey(512)
+    pk = PublicKey(sk)
     return [sk], pk, ()
 
-def falcon_sign(message: bytes, sk: list, params: tuple) -> bytes:
-    return sign(message, sk[0])
 
-def falcon_verify(message: bytes, signature: bytes, pk: bytes, params: tuple) -> bool:
+def falcon_sign(message: bytes, sk: list, params: tuple) -> bytes:
+    return sk[0].sign(message)
+
+
+def falcon_verify(message: bytes, signature: bytes, pk: PublicKey, params: tuple) -> bool:
     try:
-        verify(message, signature, pk)
-        return True
+        return pk.verify(message, signature)
     except Exception:
         return False
+
 
 def sign_and_encode_openssl(sk: list, message: bytes, params: tuple, max_planted_errors: int) -> str:
     signature = falcon_sign(message, sk, params)
@@ -64,7 +73,8 @@ def sign_and_encode_openssl(sk: list, message: bytes, params: tuple, max_planted
         bytes=bytes(a ^ b for a, b in zip(BitArray(bin=codeword).bytes, h, strict=False))
     ).bin
 
-def decode_and_verify_openssl(pk: bytes, message: bytes, binary_codeword: str, params: tuple, max_planted_errors: int) -> bool:
+
+def decode_and_verify_openssl(pk: PublicKey, message: bytes, binary_codeword: str, params: tuple, max_planted_errors: int) -> bool:
     h = hashlib.sha512(message).digest()
     unmasked = BitArray(
         bytes=bytes(a ^ b for a, b in zip(BitArray(bin=binary_codeword).bytes, h, strict=False))
